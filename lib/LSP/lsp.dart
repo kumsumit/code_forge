@@ -214,6 +214,49 @@ sealed class LspConfig {
       };
     }
 
+    if (capabilities.codeAction) {
+      textDocumentCapabilities['codeAction'] = {
+        'dynamicRegistration': false,
+        'codeActionLiteralSupport': {
+          'codeActionKind': {
+            'valueSet': [
+              'quickfix',
+              'refactor',
+              'refactor.extract',
+              'refactor.inline',
+              'refactor.rewrite',
+              'source',
+              'source.organizeImports',
+            ],
+          },
+        },
+      };
+    }
+
+    if (capabilities.goToDefinition) {
+      textDocumentCapabilities['definition'] = {'dynamicRegistration': false};
+      textDocumentCapabilities['declaration'] = {'dynamicRegistration': false};
+      textDocumentCapabilities['typeDefinition'] = {
+        'dynamicRegistration': false,
+      };
+      textDocumentCapabilities['implementation'] = {
+        'dynamicRegistration': false,
+      };
+    }
+
+    if (capabilities.rename) {
+      textDocumentCapabilities['rename'] = {
+        'dynamicRegistration': false,
+        'prepareSupport': true,
+      };
+    }
+
+    textDocumentCapabilities['formatting'] = {'dynamicRegistration': false};
+    textDocumentCapabilities['rangeFormatting'] = {
+      'dynamicRegistration': false,
+    };
+    textDocumentCapabilities['documentSymbol'] = {'dynamicRegistration': false};
+
     textDocumentCapabilities['synchronization'] = {
       'didSave': true,
       'change': 1,
@@ -223,7 +266,18 @@ sealed class LspConfig {
     };
 
     return {
-      'workspace': {'applyEdit': true, 'configuration': true},
+      'workspace': {
+        'applyEdit': true,
+        'configuration': true,
+        'workspaceEdit': {
+          'documentChanges': true,
+          'resourceOperations': ['create', 'rename', 'delete'],
+          'failureHandling': 'textOnlyTransactional',
+          'normalizesLineEndings': true,
+          'changeAnnotationSupport': {'groupsOnLabel': true},
+        },
+        'workspaceSymbol': {'dynamicRegistration': false},
+      },
       'textDocument': textDocumentCapabilities,
     };
   }
@@ -233,6 +287,16 @@ sealed class LspConfig {
       'textDocument': {'uri': Uri.file(filePath).toString()},
       'position': {'line': line, 'character': character},
     };
+  }
+
+  Map<String, dynamic> _firstLocation(dynamic result) {
+    if (result == null) return {};
+    if (result is Map<String, dynamic>) return result;
+    if (result is List && result.isNotEmpty) {
+      final first = result.first;
+      if (first is Map<String, dynamic>) return first;
+    }
+    return {};
   }
 
   /// Opens the document in the LSP server.
@@ -663,8 +727,7 @@ sealed class LspConfig {
       method: 'textDocument/definition',
       params: _commonParams(filePath, line, character),
     );
-    if (response['result'] == null) return {};
-    return response['result']?[0] ?? '';
+    return _firstLocation(response['result']);
   }
 
   /// Gets the declaration for a symbol at the specified position.
@@ -679,8 +742,7 @@ sealed class LspConfig {
       method: 'textDocument/declaration',
       params: _commonParams(filePath, line, character),
     );
-    if (response['result'] == null) return {};
-    return response['result']?[0] ?? '';
+    return _firstLocation(response['result']);
   }
 
   /// Jumps to the location where the data type of a symbol is defined.
@@ -695,8 +757,7 @@ sealed class LspConfig {
       method: 'textDocument/typeDefinition',
       params: _commonParams(filePath, line, character),
     );
-    if (response['result'] == null) return {};
-    return response['result']?[0] ?? '';
+    return _firstLocation(response['result']);
   }
 
   /// Gets the implementation locations for a symbol at the specified position.
@@ -713,9 +774,7 @@ sealed class LspConfig {
       params: _commonParams(filePath, line, character),
     );
 
-    final result = response['result'];
-    if (result == null || result.isEmpty) return {};
-    return result[0];
+    return _firstLocation(response['result']);
   }
 
   /// Retrieves all symbols defined in the current document.

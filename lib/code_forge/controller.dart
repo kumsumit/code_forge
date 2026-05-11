@@ -8,6 +8,49 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+class _WorkspaceTextEdit {
+  final int startLine;
+  final int startCharacter;
+  final int endLine;
+  final int endCharacter;
+  final String newText;
+
+  const _WorkspaceTextEdit({
+    required this.startLine,
+    required this.startCharacter,
+    required this.endLine,
+    required this.endCharacter,
+    required this.newText,
+  });
+
+  static _WorkspaceTextEdit? tryParse(Map<dynamic, dynamic> data) {
+    final range = data['range'];
+    if (range is! Map) return null;
+    final start = range['start'];
+    final end = range['end'];
+    if (start is! Map || end is! Map) return null;
+
+    final startLine = start['line'];
+    final startCharacter = start['character'];
+    final endLine = end['line'];
+    final endCharacter = end['character'];
+    if (startLine is! int ||
+        startCharacter is! int ||
+        endLine is! int ||
+        endCharacter is! int) {
+      return null;
+    }
+
+    return _WorkspaceTextEdit(
+      startLine: startLine,
+      startCharacter: startCharacter,
+      endLine: endLine,
+      endCharacter: endCharacter,
+      newText: data['newText']?.toString() ?? '',
+    );
+  }
+}
+
 /// Controller for the [CodeForge] code editor widget.
 ///
 /// This controller manages the text content, selection state, and various
@@ -857,18 +900,59 @@ class CodeForgeController implements DeltaTextInputClient {
         ? (currentlySelectedSuggestion ?? 0).clamp(0, suggestions.length - 1)
         : selectedIndex.clamp(0, suggestions.length - 1);
     final selected = suggestions[safeSelectedIndex];
-    final insertText = _extractSuggestionText(selected);
 
-    if (insertText.isNotEmpty) {
-      insertAtCurrentCursor(insertText, replaceTypedChar: true);
+    if (!_acceptCompletionWithTextEdits(selected)) {
+      final insertText = _extractSuggestionText(selected);
+
+      if (insertText.isNotEmpty) {
+        insertAtCurrentCursor(insertText, replaceTypedChar: true);
+      }
     }
 
     suggestionsNotifier.value = null;
     currentlySelectedSuggestion = 0;
   }
 
+  bool _acceptCompletionWithTextEdits(dynamic suggestion) {
+    final item = _completionItemMap(suggestion);
+    if (item == null) return false;
+
+    final edits = <_WorkspaceTextEdit>[];
+    final textEdit = item['textEdit'];
+    if (textEdit is Map) {
+      final insertReplaceEdit = textEdit['insert'] != null
+          ? {'range': textEdit['insert'], 'newText': textEdit['newText']}
+          : textEdit;
+      final parsed = _WorkspaceTextEdit.tryParse(insertReplaceEdit);
+      if (parsed != null) edits.add(parsed);
+    }
+
+    final additionalTextEdits = item['additionalTextEdits'];
+    if (additionalTextEdits is List) {
+      edits.addAll(_parseWorkspaceTextEdits(additionalTextEdits));
+    }
+
+    if (edits.isEmpty) return false;
+    _applyTextEditsToOpenBuffer(edits);
+    return true;
+  }
+
+  Map<dynamic, dynamic>? _completionItemMap(dynamic suggestion) {
+    if (suggestion is LspCompletion) return suggestion.completionItem;
+    if (suggestion is Map) return suggestion;
+    return null;
+  }
+
   String _extractSuggestionText(dynamic suggestion) {
     if (suggestion is LspCompletion) {
+      final item = suggestion.completionItem;
+      final insertText = item['insertText'];
+      if (insertText is String && insertText.isNotEmpty) return insertText;
+      final textEdit = item['textEdit'];
+      if (textEdit is Map) {
+        final newText = textEdit['newText'];
+        if (newText is String && newText.isNotEmpty) return newText;
+      }
       return suggestion.label;
     }
     if (suggestion is Map) {
@@ -1446,7 +1530,7 @@ class CodeForgeController implements DeltaTextInputClient {
 
   /// The tabspace inserted on tab key press.
   String get tabSpace {
-    if(useSpaceAsTab) {
+    if (useSpaceAsTab) {
       return ' ' * tabSize;
     }
     return '\t' * tabSize;
@@ -3270,153 +3354,430 @@ class CodeForgeController implements DeltaTextInputClient {
   /// Applies a workspace edit or code action payload coming from the LSP.
   ///
   /// The method understands several forms: a map with an `edit` containing
-  /// `changes`, `documentChanges`, a raw list of edits, or a command. It will
-  /// apply text edits to the currently opened file and update the LSP server
-  /// document afterwards.
+  /// `changes`, `documentChanges`, a raw list of edits, or a command. Text
+  /// edits for the currently opened file are applied to the editor buffer;
+  /// edits for other files are applied directly on disk.
   Future<void> applyWorkspaceEdit(dynamic action) async {
-    if (openedFile == null) return;
-    final fileUri = Uri.file(openedFile!).toString();
+    final editPayload = action is Map && action['edit'] is Map
+        ? action['edit']
+        : action;
+    final editsByUri = <String, List<_WorkspaceTextEdit>>{};
+
+    if (editPayload is Map && editPayload['documentChanges'] is List) {
+      await _applyDocumentChangesInOrder(
+        List<dynamic>.from(editPayload['documentChanges'] as List),
+      );
+      final changes = editPayload['changes'];
+      if (changes != null) {
+        editsByUri.addAll(_collectWorkspaceTextEdits({'changes': changes}));
+      }
+    } else {
+      editsByUri.addAll(_collectWorkspaceTextEdits(editPayload));
+    }
+
+    if (editsByUri.isNotEmpty) {
+      await _applyTextEditsByUri(editsByUri);
+    }
 
     if (action is Map && action.containsKey('command')) {
-      final String command = action['command'];
-      final List args = action['arguments'] ?? [];
-      await lspConfig?.executeCommand(command, args);
-      return;
-    } else if (action is Map &&
-        action.containsKey('edit') &&
-        (action['edit'] as Map).containsKey('changes')) {
-      final Map changes = action['edit']['changes'] as Map;
-      if (changes.containsKey(fileUri)) {
-        final List edits = List.from(changes[fileUri] as List);
-        final converted = <Map<String, dynamic>>[];
-        for (final e in edits) {
-          try {
-            final start = e['range']?['start'];
-            final end = e['range']?['end'];
-            if (start == null || end == null) continue;
-            final startOffset =
-                getLineStartOffset(start['line'] as int) +
-                (start['character'] as int);
-            final endOffset =
-                getLineStartOffset(end['line'] as int) +
-                (end['character'] as int);
-            final newText = e['newText'] as String? ?? '';
-            converted.add({
-              'start': startOffset,
-              'end': endOffset,
-              'newText': newText,
-            });
-          } catch (_) {
-            continue;
-          }
-        }
-        converted.sort(
-          (a, b) => (b['start'] as int).compareTo(a['start'] as int),
+      final commandPayload = action['command'];
+      final command = commandPayload is Map
+          ? commandPayload['command']
+          : commandPayload;
+      if (command is String && command.isNotEmpty) {
+        final args = commandPayload is Map
+            ? commandPayload['arguments']
+            : action['arguments'];
+        await lspConfig?.executeCommand(
+          command,
+          args is List ? args : const [],
         );
-        for (final ce in converted) {
-          replaceRange(
-            ce['start'] as int,
-            ce['end'] as int,
-            ce['newText'] as String,
-            preserveOldCursor: true,
-          );
-        }
-        if (lspConfig != null) {
-          await lspConfig!.updateDocument(openedFile!, text);
-        }
-      }
-      return;
-    } else if (action is Map &&
-        action.containsKey('documentChanges') &&
-        action['documentChanges'] is List) {
-      final List docChanges = List.from(action['documentChanges'] as List);
-      for (final dc in docChanges) {
-        if (dc is Map) {
-          final td = dc['textDocument'];
-          final uri = td != null ? td['uri'] as String? : null;
-          if (uri == fileUri && dc.containsKey('edits')) {
-            final List edits = List.from(dc['edits'] as List);
-            final converted = <Map<String, dynamic>>[];
-            for (final e in edits) {
-              try {
-                final start = e['range']?['start'];
-                final end = e['range']?['end'];
-                if (start == null || end == null) continue;
-                final int startOffset =
-                    getLineStartOffset(start['line'] as int) +
-                    (start['character'] as int);
-                final int endOffset =
-                    getLineStartOffset(end['line'] as int) +
-                    (end['character'] as int);
-                final String newText = e['newText'] as String? ?? '';
-                converted.add({
-                  'start': startOffset,
-                  'end': endOffset,
-                  'newText': newText,
-                });
-              } catch (_) {
-                continue;
-              }
-            }
-            converted.sort(
-              (a, b) => (b['start'] as int).compareTo(a['start'] as int),
-            );
-            for (final ce in converted) {
-              replaceRange(
-                ce['start'] as int,
-                ce['end'] as int,
-                ce['newText'] as String,
-                preserveOldCursor: true,
-              );
-            }
-            if (lspConfig != null) {
-              await lspConfig!.updateDocument(openedFile!, text);
-            }
-          }
-        }
-      }
-      return;
-    } else if (action is List) {
-      final converted = <Map<String, dynamic>>[];
-      try {
-        for (Map<String, dynamic> item in action) {
-          if (!(item.containsKey('newText') && item.containsKey('range'))) {
-            return;
-          }
-          final start = item['range']?['start'];
-          final end = item['range']?['end'];
-          if (start == null || end == null) return;
-          final startOffset =
-              getLineStartOffset(start['line'] as int) +
-              (start['character'] as int);
-          final endOffset =
-              getLineStartOffset(end['line'] as int) +
-              (end['character'] as int);
-          final newText = item['newText'] as String? ?? '';
-          converted.add({
-            'start': startOffset,
-            'end': endOffset,
-            'newText': newText,
-          });
-        }
-      } catch (_) {
-        return;
-      }
-      converted.sort(
-        (a, b) => (b['start'] as int).compareTo(a['start'] as int),
-      );
-      for (final ce in converted) {
-        replaceRange(
-          ce['start'] as int,
-          ce['end'] as int,
-          ce['newText'] as String,
-          preserveOldCursor: true,
-        );
-      }
-      if (lspConfig != null) {
-        await lspConfig!.updateDocument(openedFile!, text);
       }
     }
+  }
+
+  Future<void> _applyDocumentChangesInOrder(
+    List<dynamic> documentChanges,
+  ) async {
+    for (final change in documentChanges) {
+      if (change is! Map) continue;
+      final kind = change['kind'];
+      if (kind == 'create' || kind == 'rename' || kind == 'delete') {
+        await _applyResourceOperation(change);
+        continue;
+      }
+
+      final textDocument = change['textDocument'];
+      final uri = textDocument is Map ? textDocument['uri']?.toString() : null;
+      final edits = change['edits'];
+      if (uri == null || edits is! List) continue;
+      final parsedEdits = _parseWorkspaceTextEdits(edits);
+      if (parsedEdits.isEmpty) continue;
+      await _applyTextEditsByUri({uri: parsedEdits});
+    }
+  }
+
+  Future<void> _applyResourceOperation(Map<dynamic, dynamic> operation) async {
+    final kind = operation['kind'];
+    switch (kind) {
+      case 'create':
+        await _applyCreateFileOperation(operation);
+      case 'rename':
+        await _applyRenameFileOperation(operation);
+      case 'delete':
+        await _applyDeleteFileOperation(operation);
+    }
+  }
+
+  Future<void> _applyCreateFileOperation(
+    Map<dynamic, dynamic> operation,
+  ) async {
+    final uri = operation['uri']?.toString();
+    final filePath = uri == null ? null : _filePathFromUri(uri);
+    if (filePath == null) return;
+
+    final options = operation['options'];
+    final overwrite = options is Map && options['overwrite'] == true;
+    final file = File(filePath);
+
+    if (file.existsSync()) {
+      if (overwrite) {
+        await file.writeAsString('');
+      }
+      return;
+    }
+
+    await file.parent.create(recursive: true);
+    await file.writeAsString('');
+  }
+
+  Future<void> _applyRenameFileOperation(
+    Map<dynamic, dynamic> operation,
+  ) async {
+    final oldUri = operation['oldUri']?.toString();
+    final newUri = operation['newUri']?.toString();
+    final oldPath = oldUri == null ? null : _filePathFromUri(oldUri);
+    final newPath = newUri == null ? null : _filePathFromUri(newUri);
+    if (oldPath == null || newPath == null) return;
+
+    final options = operation['options'];
+    final overwrite = options is Map && options['overwrite'] == true;
+    final ignoreIfExists = options is Map && options['ignoreIfExists'] == true;
+    final sourceFile = File(oldPath);
+    final sourceDir = Directory(oldPath);
+    final targetFile = File(newPath);
+    final targetDir = Directory(newPath);
+
+    if (!sourceFile.existsSync() && !sourceDir.existsSync()) return;
+    if (targetFile.existsSync() || targetDir.existsSync()) {
+      if (ignoreIfExists) return;
+      if (!overwrite) return;
+      if (targetFile.existsSync()) {
+        await targetFile.delete();
+      } else {
+        await targetDir.delete(recursive: true);
+      }
+    }
+
+    await Directory(newPath).parent.create(recursive: true);
+    if (sourceFile.existsSync()) {
+      await sourceFile.rename(newPath);
+    } else {
+      await sourceDir.rename(newPath);
+    }
+
+    if (openedFile == oldPath) {
+      _openedFile = newPath;
+      if (lspConfig != null && lspConfig!.isInitialized) {
+        await lspConfig!.closeDocument(oldPath);
+        await _openDocumentInLsp();
+      }
+    }
+  }
+
+  Future<void> _applyDeleteFileOperation(
+    Map<dynamic, dynamic> operation,
+  ) async {
+    final uri = operation['uri']?.toString();
+    final filePath = uri == null ? null : _filePathFromUri(uri);
+    if (filePath == null) return;
+
+    final options = operation['options'];
+    final recursive = options is Map && options['recursive'] == true;
+    final ignoreIfNotExists =
+        options is Map && options['ignoreIfNotExists'] == true;
+    final file = File(filePath);
+    final dir = Directory(filePath);
+
+    if (file.existsSync()) {
+      await file.delete();
+      if (openedFile == filePath) {
+        _openedFile = null;
+      }
+      return;
+    }
+
+    if (dir.existsSync()) {
+      await dir.delete(recursive: recursive);
+      if (openedFile != null && openedFile!.startsWith('$filePath/')) {
+        _openedFile = null;
+      }
+      return;
+    }
+
+    if (ignoreIfNotExists) return;
+  }
+
+  /// Formats the opened document through the configured LSP server and applies
+  /// the returned edits to the editor.
+  Future<void> formatDocument() async {
+    if (lspConfig == null || openedFile == null) return;
+    final edits = await lspConfig!.formatDocument(openedFile!);
+    await applyWorkspaceEdit(edits);
+  }
+
+  /// Formats the current selection through the configured LSP server.
+  ///
+  /// If the selection is collapsed, this formats the whole document.
+  Future<void> formatSelection() async {
+    if (lspConfig == null || openedFile == null) return;
+    final sel = selection;
+    if (sel.isCollapsed) {
+      await formatDocument();
+      return;
+    }
+
+    final startLine = getLineAtOffset(sel.start);
+    final endLine = getLineAtOffset(sel.end);
+    final startCharacter = sel.start - getLineStartOffset(startLine);
+    final endCharacter = sel.end - getLineStartOffset(endLine);
+    final edits = await lspConfig!.formatRange(
+      filePath: openedFile!,
+      startLine: startLine,
+      startCharacter: startCharacter,
+      endLine: endLine,
+      endCharacter: endCharacter,
+    );
+    await applyWorkspaceEdit(edits);
+  }
+
+  /// Renames the symbol at the current cursor position through the configured
+  /// LSP server and applies the returned workspace edit.
+  Future<void> renameSymbolAtCursor(String newName) async {
+    if (lspConfig == null || openedFile == null || newName.isEmpty) return;
+    final cursorPosition = selection.extentOffset;
+    final line = getLineAtOffset(cursorPosition);
+    final character = cursorPosition - getLineStartOffset(line);
+    final edit = await lspConfig!.renameSymbol(
+      openedFile!,
+      line,
+      character,
+      newName,
+    );
+    await applyWorkspaceEdit(edit);
+  }
+
+  /// Returns the first definition location for the symbol at the cursor.
+  Future<Map<String, dynamic>> getDefinitionAtCursor() async {
+    if (lspConfig == null || openedFile == null) return {};
+    final cursorPosition = selection.extentOffset;
+    final line = getLineAtOffset(cursorPosition);
+    final character = cursorPosition - getLineStartOffset(line);
+    return lspConfig!.getDefinition(openedFile!, line, character);
+  }
+
+  Map<String, List<_WorkspaceTextEdit>> _collectWorkspaceTextEdits(
+    dynamic payload,
+  ) {
+    final result = <String, List<_WorkspaceTextEdit>>{};
+    final currentUri = openedFile == null
+        ? null
+        : Uri.file(openedFile!).toString();
+
+    void addEdit(String uri, dynamic rawEdit) {
+      if (rawEdit is! Map) return;
+      final edit = _WorkspaceTextEdit.tryParse(rawEdit);
+      if (edit == null) return;
+      result.putIfAbsent(uri, () => []).add(edit);
+    }
+
+    if (payload is List && currentUri != null) {
+      for (final rawEdit in payload) {
+        addEdit(currentUri, rawEdit);
+      }
+      return result;
+    }
+
+    if (payload is! Map) return result;
+
+    final changes = payload['changes'];
+    if (changes is Map) {
+      for (final entry in changes.entries) {
+        final uri = entry.key?.toString();
+        final edits = entry.value;
+        if (uri == null || edits is! List) continue;
+        for (final rawEdit in edits) {
+          addEdit(uri, rawEdit);
+        }
+      }
+    }
+
+    final documentChanges = payload['documentChanges'];
+    if (documentChanges is List) {
+      for (final change in documentChanges) {
+        if (change is! Map) continue;
+        final textDocument = change['textDocument'];
+        final uri = textDocument is Map
+            ? textDocument['uri']?.toString()
+            : null;
+        final edits = change['edits'];
+        if (uri == null || edits is! List) continue;
+        for (final rawEdit in edits) {
+          addEdit(uri, rawEdit);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  List<_WorkspaceTextEdit> _parseWorkspaceTextEdits(List<dynamic> edits) {
+    final parsed = <_WorkspaceTextEdit>[];
+    for (final rawEdit in edits) {
+      if (rawEdit is! Map) continue;
+      final edit = _WorkspaceTextEdit.tryParse(rawEdit);
+      if (edit != null) parsed.add(edit);
+    }
+    return parsed;
+  }
+
+  Future<void> _applyTextEditsByUri(
+    Map<String, List<_WorkspaceTextEdit>> editsByUri,
+  ) async {
+    final currentFilePath = openedFile;
+    final currentUri = currentFilePath == null
+        ? null
+        : Uri.file(currentFilePath).toString();
+
+    for (final entry in editsByUri.entries) {
+      final uri = entry.key;
+      final edits = entry.value;
+      if (edits.isEmpty) continue;
+
+      if (uri == currentUri) {
+        _applyTextEditsToOpenBuffer(edits);
+        if (lspConfig != null && currentFilePath != null) {
+          await lspConfig!.updateDocument(currentFilePath, text);
+        }
+        continue;
+      }
+
+      final filePath = _filePathFromUri(uri);
+      if (filePath == null) continue;
+      final file = File(filePath);
+      if (!file.existsSync()) continue;
+
+      final original = await file.readAsString();
+      final updated = _applyTextEditsToString(original, edits);
+      if (updated == original) continue;
+
+      await file.writeAsString(updated);
+      if (lspConfig != null) {
+        await lspConfig!.updateDocument(filePath, updated);
+      }
+    }
+  }
+
+  void _applyTextEditsToOpenBuffer(List<_WorkspaceTextEdit> edits) {
+    final converted = <({int start, int end, String newText})>[];
+    for (final edit in edits) {
+      final startOffset = _offsetForLspPosition(
+        text,
+        edit.startLine,
+        edit.startCharacter,
+      );
+      final endOffset = _offsetForLspPosition(
+        text,
+        edit.endLine,
+        edit.endCharacter,
+      );
+      if (startOffset == null || endOffset == null) continue;
+      converted.add((
+        start: startOffset,
+        end: endOffset,
+        newText: edit.newText,
+      ));
+    }
+
+    converted.sort((a, b) => b.start.compareTo(a.start));
+    final compound = _undoController?.beginCompoundOperation();
+    for (final edit in converted) {
+      replaceRange(edit.start, edit.end, edit.newText, preserveOldCursor: true);
+    }
+    compound?.end();
+  }
+
+  String _applyTextEditsToString(
+    String source,
+    List<_WorkspaceTextEdit> edits,
+  ) {
+    final converted = <({int start, int end, String newText})>[];
+    for (final edit in edits) {
+      final startOffset = _offsetForLspPosition(
+        source,
+        edit.startLine,
+        edit.startCharacter,
+      );
+      final endOffset = _offsetForLspPosition(
+        source,
+        edit.endLine,
+        edit.endCharacter,
+      );
+      if (startOffset == null || endOffset == null) continue;
+      converted.add((
+        start: startOffset,
+        end: endOffset,
+        newText: edit.newText,
+      ));
+    }
+
+    converted.sort((a, b) => b.start.compareTo(a.start));
+    var updated = source;
+    for (final edit in converted) {
+      final safeStart = edit.start.clamp(0, updated.length);
+      final safeEnd = edit.end.clamp(safeStart, updated.length);
+      updated = updated.replaceRange(safeStart, safeEnd, edit.newText);
+    }
+    return updated;
+  }
+
+  int? _offsetForLspPosition(String source, int line, int character) {
+    if (line < 0 || character < 0) return null;
+    var currentLine = 0;
+    var lineStart = 0;
+
+    for (var i = 0; i < source.length && currentLine < line; i++) {
+      if (source.codeUnitAt(i) == 10) {
+        currentLine++;
+        lineStart = i + 1;
+      }
+    }
+
+    if (currentLine != line) return null;
+    var lineEnd = source.indexOf('\n', lineStart);
+    if (lineEnd == -1) lineEnd = source.length;
+    return (lineStart + character).clamp(lineStart, lineEnd);
+  }
+
+  String? _filePathFromUri(String uri) {
+    try {
+      final parsed = Uri.parse(uri);
+      if (parsed.scheme == 'file') return parsed.toFilePath();
+      if (parsed.scheme.isEmpty) return uri;
+    } catch (_) {
+      return uri;
+    }
+    return null;
   }
 
   /// Calls the [LSP signature help](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_signatureHelp) feature.
