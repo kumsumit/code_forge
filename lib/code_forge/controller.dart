@@ -2818,6 +2818,12 @@ class CodeForgeController implements DeltaTextInputClient {
 
   @protected
   @override
+  bool onFocusReceived() {
+    return true;
+  }
+
+  @protected
+  @override
   void updateEditingValue(TextEditingValue value) {
     text = value.text;
     selection = value.selection;
